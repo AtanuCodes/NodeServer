@@ -8,7 +8,7 @@ const cron = require("node-cron");
 require("dotenv").config();
 
 const IDLC_BASE_URL = "https://192.168.110.140/iTradeServices";
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 
 // Create Express app and HTTP server
 const app = express();
@@ -16,14 +16,19 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: "*", // Allow all origins
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"], // Allow common methods
+  allowedHeaders: ["Content-Type", "Authorization"], // Allow common headers
+  credentials: true,
+}));
 app.use(express.json());
 
 // Store connected clients
 const clients = new Set();
 
-// Store latest stock data
-let latestStockData = null;
+// Store latest stock data as a map for quick lookups (key: trading_code)
+let latestStockMap = new Map();
 let authToken = null;
 
 // Corrected Axios default config (moved httpsAgent and proxy out of headers)
@@ -148,8 +153,8 @@ async function getAllStockCompanies(token, retryCount = 5) { // Increased retrie
   return null;
 }
 
-// Function to fetch and broadcast stock data
-async function fetchAndBroadcastStockData() {
+// Function to fetch stock data, detect changes, and broadcast updates
+async function fetchAndBroadcastStockData(isInitial = false) {
   console.log("Starting fetch and broadcast...");
   if (!authToken) {
     const token = await getIDLCAuthToken();
@@ -161,33 +166,53 @@ async function fetchAndBroadcastStockData() {
 
   const stockData = await getAllStockCompanies(authToken);
   if (stockData) {
-    const mappedData = stockData.map((item) => ({
-      trading_code: item.dseCompanyCode,
-      last_trading_price: item.ycp,
-      change: item.mktValueChange,
-      change_percent: item.mktValChangePercentage,
-      indicator: item.mktValueChange >= 0 ? "Up" : "Down",
-    }));
+    const newStockMap = new Map();
+    const updates = [];
 
-    latestStockData = mappedData;
+    stockData.forEach((item) => {
+      const mappedItem = {
+        trading_code: item.dseCompanyCode,
+        last_trading_price: item.ycp,
+        change: item.mktValueChange,
+        change_percent: item.mktValChangePercentage,
+        indicator: item.mktValueChange >= 0 ? "Up" : "Down",
+      };
 
-    // Broadcast to all connected clients
-    const message = JSON.stringify({
-      type: "stock_data",
-      data: mappedData,
-      timestamp: new Date().toISOString(),
-    });
+      const key = mappedItem.trading_code;
+      newStockMap.set(key, mappedItem);
 
-    clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(message);
+      // Compare with previous
+      const prevItem = latestStockMap.get(key);
+      if (isInitial || !prevItem || 
+          prevItem.last_trading_price !== mappedItem.last_trading_price ||
+          prevItem.change !== mappedItem.change ||
+          prevItem.change_percent !== mappedItem.change_percent) {
+        updates.push(mappedItem);
       }
     });
 
-    console.log(`Broadcasted data to ${clients.size} clients`);
-    return mappedData;
+    // Update latest map
+    latestStockMap = newStockMap;
+
+    if (updates.length > 0 || isInitial) {
+      // Broadcast: full data on initial, updates otherwise
+      const message = JSON.stringify({
+        type: isInitial ? "stock_data" : "stock_update",
+        data: isInitial ? Array.from(newStockMap.values()) : updates,
+        timestamp: new Date().toISOString(),
+      });
+
+      clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(message);
+        }
+      });
+
+      console.log(`Broadcasted ${isInitial ? 'full data' : 'updates'} to ${clients.size} clients: ${updates.length} changes`);
+    } else {
+      console.log('No changes detected, skipping broadcast');
+    }
   }
-  return null;
 }
 
 // Separate API Routes for Postman testing
@@ -229,7 +254,7 @@ app.get("/api/stock", async (req, res) => {
     if (stockData) {
       const mappedData = stockData.map((item) => ({
         trading_code: item.dseCompanyCode,
-        last_trading_price: item.ycp,
+        last_trading_price: item.mktValue,
         change: item.mktValueChange,
         change_percent: item.mktValChangePercentage,
         indicator: item.mktValueChange >= 0 ? "Up" : "Down",
@@ -257,10 +282,10 @@ app.get("/api/stock", async (req, res) => {
 
 // Latest stock data route: GET /api/latest-stock (cached)
 app.get("/api/latest-stock", (req, res) => {
-  if (latestStockData) {
+  if (latestStockMap.size > 0) {
     res.json({
       status: "success",
-      data: latestStockData,
+      data: Array.from(latestStockMap.values()),
       timestamp: new Date().toISOString(),
     });
   } else {
@@ -276,18 +301,18 @@ wss.on("connection", (ws) => {
   console.log("New client connected");
   clients.add(ws);
 
-  // Send initial data on connection
-  if (latestStockData) {
+  // Send initial full data on connection
+  if (latestStockMap.size > 0) {
     ws.send(
       JSON.stringify({
         type: "stock_data",
-        data: latestStockData,
+        data: Array.from(latestStockMap.values()),
         timestamp: new Date().toISOString(),
       })
     );
   } else {
     // Fetch initial if no data
-    fetchAndBroadcastStockData();
+    fetchAndBroadcastStockData(true);
   }
 
   ws.on("close", () => {
@@ -301,8 +326,8 @@ wss.on("connection", (ws) => {
   });
 });
 
-// Fetch stock data at regular intervals (every 30 seconds)
-cron.schedule("*/30 * * * * *", () => {
+// Fetch stock data at regular intervals (every 3 seconds)
+cron.schedule("*/3 * * * * *", () => {
   console.log("Cron job: Fetching latest stock data...");
   fetchAndBroadcastStockData();
 });
@@ -312,7 +337,7 @@ setTimeout(async () => {
   console.log("Initial auth and fetch...");
   const token = await getIDLCAuthToken();
   if (token) {
-    await fetchAndBroadcastStockData();
+    await fetchAndBroadcastStockData(true);
   }
 }, 2000);
 
