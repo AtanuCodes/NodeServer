@@ -7,7 +7,7 @@ const cors = require("cors");
 const cron = require("node-cron");
 require("dotenv").config();
 
-const IDLC_BASE_URL = "https://amldfs.idlc.com/iTradeServices";
+const IDLC_BASE_URL = "https://192.168.110.140/iTradeServices";
 const PORT = process.env.PORT || 3000;
 
 // Create Express app and HTTP server
@@ -26,20 +26,23 @@ const clients = new Set();
 let latestStockData = null;
 let authToken = null;
 
-// Axios default config to mimic browser and add timeout/retry
+// Corrected Axios default config (moved httpsAgent and proxy out of headers)
+const { Agent } = require("https");
+const httpsAgent = new Agent({ rejectUnauthorized: false }); // Ignore SSL cert errors if needed
+
 const axiosConfig = {
-  timeout: 30000, // 30 seconds timeout
+  timeout: 60000, // Increased to 60 seconds for slower connections
   headers: {
     "Content-Type": "application/json",
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    httpsAgent: new (require("https").Agent)({ rejectUnauthorized: false }),
-    proxy: false,
   },
+  httpsAgent, // Top-level config for HTTPS
+  proxy: false, // Explicitly disable proxy if not needed
 };
 
 // Function to get authentication token with retry logic
-async function getIDLCAuthToken(retryCount = 3) {
+async function getIDLCAuthToken(retryCount = 5) { 
   const payload = {
     data: {
       EmailID: process.env.EMAIL_ID,
@@ -66,7 +69,7 @@ async function getIDLCAuthToken(retryCount = 3) {
           response.data.result.resultMessage
         );
         if (attempt < retryCount) {
-          await new Promise((resolve) => setTimeout(resolve, 2000 * attempt)); // Exponential backoff
+          await new Promise((resolve) => setTimeout(resolve, 5000 * attempt)); // Increased backoff
         }
         continue;
       }
@@ -75,10 +78,10 @@ async function getIDLCAuthToken(retryCount = 3) {
         `Auth attempt ${attempt} error:`,
         error.response?.data || error.message || error.code
       );
-      if (error.code === "ETIMEDOUT" || error.code === "ECONNRESET") {
+      if (error.code === "ETIMEDOUT" || error.code === "ECONNRESET" || error.code === "ECONNABORTED") {
         console.log("Connection timeout, retrying...");
         if (attempt < retryCount) {
-          await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+          await new Promise((resolve) => setTimeout(resolve, 5000 * attempt));
           continue;
         }
       }
@@ -89,7 +92,7 @@ async function getIDLCAuthToken(retryCount = 3) {
 }
 
 // Function to get stock data with retry
-async function getAllStockCompanies(token, retryCount = 3) {
+async function getAllStockCompanies(token, retryCount = 5) { // Increased retries
   if (!token) {
     console.error("Authentication token is required.");
     return null;
@@ -125,6 +128,7 @@ async function getAllStockCompanies(token, retryCount = 3) {
       if (
         error.code === "ETIMEDOUT" ||
         error.code === "ECONNRESET" ||
+        error.code === "ECONNABORTED" ||
         (error.response && error.response.status === 401)
       ) {
         // If 401, refresh token
@@ -134,7 +138,7 @@ async function getAllStockCompanies(token, retryCount = 3) {
           token = authToken;
         }
         if (attempt < retryCount) {
-          await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+          await new Promise((resolve) => setTimeout(resolve, 5000 * attempt));
           continue;
         }
       }
